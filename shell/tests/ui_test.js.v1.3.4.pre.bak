@@ -1,0 +1,139 @@
+/* Files 面板的 UI 级测试：点目录进、点文件开、改内容保存、新建文件/目录、删除、越界提示
+ * 用法： node ui_test.js           （默认连 http://127.0.0.1:8095）
+ *        LLM_WEB=http://127.0.0.1:8093 node ui_test.js
+ *        FSTEST_DIR=/data/hello/tmp/xxx node ui_test.js
+ */
+const fs = require('fs');
+const { buildDom, installGlobals, sleep, waitFor } = require('./domstub');
+
+const BASE    = process.env.LLM_WEB   || 'http://127.0.0.1:8095';
+const FSDIR   = process.env.FSTEST_DIR || '/data/hello/tmp/llm_web_tests';
+const realFetch = global.fetch;
+
+let pass = 0, fail = 0;
+const check = (n, c, e = '') => c ? (pass++, console.log('  PASS  ' + n))
+                                  : (fail++, console.log('  FAIL  ' + n + '   ' + e));
+
+(async () => {
+  const html = await (await realFetch(BASE + '/')).text();
+  const js   = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  const byId = buildDom(html);
+  installGlobals(byId, BASE, realFetch);
+
+  fs.mkdirSync(FSDIR, { recursive: true });
+  eval(js);                                  // 执行前端脚本
+  await waitFor(() => byId['stat']._text.length > 0, 5000);   // 等 health 探测回来
+
+  const rows = () => {
+    const table = byId['fs-list'].children[0];
+    if (!table) return [];
+    const tbody = table.children[0];
+    return tbody ? tbody.children : [];
+  };
+  const findRow = part => rows().find(tr => tr.children[0] && tr.children[0].textContent.includes(part));
+
+  console.log('== 前端加载 ==');
+  check('前端脚本执行没抛异常', true);
+  check('Chat 默认勾选“文件操作”', byId['use-fs'].checked === true);
+  check('工作区默认 /', byId['fs-root'].value === '/', byId['fs-root'].value);
+  check('health 探测有结果', byId['stat']._text.length > 0, byId['stat']._text);
+
+  console.log('== 沙箱范围勾选框 ==');
+  const health = await (await realFetch(BASE + '/api/health')).json();
+  const scopeTag = html.match(/<input[^>]*id="fs-inside"[^>]*>/);
+  const scopeLab = html.match(/<label id="fs-scope"[^>]*>/);
+  check('Files 面板有沙箱勾选框', !!byId['fs-inside']);
+  check('勾选框默认是勾上的（= 只允许工作区内）', byId['fs-inside'].checked === true);
+  check('勾选框是可手动勾选的开关（没有 disabled）',
+        !!scopeTag && !/\bdisabled\b/.test(scopeTag[0]), scopeTag && scopeTag[0]);
+  check('勾选框上写明了勾上/取消各是什么意思',
+        !!scopeLab && /title="勾上[^"]*取消勾选[^"]*"/.test(scopeLab[0]), scopeLab && scopeLab[0]);
+  check('勾选框文案说的是当前工作区根',
+        byId['fs-scope-txt']._text === '只允许操作 ' + health.fs_root + ' 内的路径',
+        byId['fs-scope-txt']._text);
+  check('health 带 fs_root / fs_allow_outside',
+        typeof health.fs_root === 'string' && health.fs_allow_outside === false, health);
+  check('勾上/放开与服务端状态一致（本服务没带 --fs-allow-outside）',
+        byId['fs-inside'].checked === !health.fs_allow_outside, health);
+
+  console.log('== Files 面板 ==');
+  fs.writeFileSync(FSDIR + '/ui_edit.txt', 'before\n');   // 先放个文件，空目录不会渲染表格
+  fs.writeFileSync(FSDIR + '/ui_seed.txt', 'seed\n');
+  byId['fs-path'].value = FSDIR;
+  byId['tab-files'].click();
+  await waitFor(() => rows().length > 0, 5000);
+  check('切到 Files 面板', !byId['panel-files'].classList.contains('hidden'));
+  check('目录列表渲染出表格', rows().length > 0, '行数=' + rows().length);
+  check('状态栏显示条目数', /项/.test(byId['fs-msg']._text), byId['fs-msg']._text);
+
+  console.log('== 打开文件 → 改内容 → 保存 ==');
+  const row = findRow('ui_edit.txt');
+  check('新文件出现在列表里', !!row);
+  row.children[0].click();                    // 点文件名 = 打开
+  await waitFor(() => !byId['fs-edit'].classList.contains('hidden'), 5000);
+  check('编辑器打开', !byId['fs-edit'].classList.contains('hidden'));
+  check('读到内容正确', byId['fs-text'].value === 'before\n', JSON.stringify(byId['fs-text'].value));
+  byId['fs-text'].value = 'after from UI\n';
+  byId['fs-charset'].value = 'utf-8';
+  byId['fs-eol'].value = 'lf';
+  byId['fs-save'].click();
+  await waitFor(() => fs.readFileSync(FSDIR + '/ui_edit.txt', 'utf8') === 'after from UI\n', 5000);
+  check('保存后磁盘内容已变', fs.readFileSync(FSDIR + '/ui_edit.txt', 'utf8') === 'after from UI\n');
+
+  console.log('== 新建文件 / 新建目录 / 删除 ==');
+  global.__promptAnswer = 'ui_new.txt';
+  byId['fs-newfile'].click();
+  await waitFor(() => fs.existsSync(FSDIR + '/ui_new.txt'), 5000);
+  check('新建文件真的落盘', fs.existsSync(FSDIR + '/ui_new.txt'));
+  check('新建后自动打开编辑器', byId['fs-edit-name']._text.includes('ui_new.txt'), byId['fs-edit-name']._text);
+
+  global.__promptAnswer = 'ui_newdir';
+  byId['fs-newdir'].click();
+  await waitFor(() => fs.existsSync(FSDIR + '/ui_newdir'), 5000);
+  check('新建目录真的落盘', fs.existsSync(FSDIR + '/ui_newdir') && fs.statSync(FSDIR + '/ui_newdir').isDirectory());
+
+  byId['fs-refresh'].click();
+  await waitFor(() => findRow('ui_new.txt'), 5000);
+  findRow('ui_new.txt').children[4].children[0].click();   // 删除按钮
+  await waitFor(() => !fs.existsSync(FSDIR + '/ui_new.txt'), 5000);
+  check('删除按钮生效', !fs.existsSync(FSDIR + '/ui_new.txt'));
+
+  console.log('== 沙箱范围：工作区 / 时可以直接越界 ==');
+  byId['fs-root'].value = '/';                 // 聊天栏的“工作区”就是文件面板的沙箱根，默认 /
+  byId['fs-path'].value = '/etc';
+  byId['fs-go'].click();
+  await waitFor(() => /项/.test(byId['fs-msg']._text), 5000);
+  check('工作区 / 时能直接浏览 /etc（可以越界）',
+        /项/.test(byId['fs-msg']._text) && rows().length > 0, byId['fs-msg']._text);
+
+  console.log('== 把工作区收窄到 /data/hello 后，越界被拒 ==');
+  byId['fs-root'].value = '/data/hello';
+  byId['fs-path'].value = '/etc';
+  byId['fs-go'].click();
+  await waitFor(() => byId['fs-msg'].classList.contains('err'), 5000);
+  check('越界目录给出错误提示', byId['fs-msg'].classList.contains('err'), byId['fs-msg']._text);
+  check('错误里写清了范围', /只允许操作 \/data\/hello 内的路径/.test(byId['fs-msg']._text), byId['fs-msg']._text);
+  check('越界后界面不崩', true);
+
+  console.log('== 勾选框能手动勾：取消 = 放开，勾上 = 收紧（v1.3.3）==');
+  const clickBox = want => { byId['fs-inside'].checked = want; byId['fs-inside'].dispatch('change'); };
+  clickBox(false);                                  // 手动取消勾选
+  await waitFor(() => !byId['fs-msg'].classList.contains('err') && /项/.test(byId['fs-msg']._text), 5000);
+  check('取消勾选后同一条越界路径立刻能读',
+        /项/.test(byId['fs-msg']._text), byId['fs-msg']._text);
+  check('取消勾选后文案写「已放开越界限制」',
+        /已放开越界限制/.test(byId['fs-scope-txt']._text), byId['fs-scope-txt']._text);
+  check('取消勾选的状态存进 localStorage',
+        JSON.parse(global.localStorage.getItem('llm_web_chat_conf_v2') || '{}').outside === true,
+        global.localStorage.getItem('llm_web_chat_conf_v2'));
+  clickBox(true);                                   // 再勾回来
+  await waitFor(() => byId['fs-msg'].classList.contains('err'), 5000);
+  check('重新勾上后同一条路径又被拒（越界）',
+        byId['fs-msg'].classList.contains('err') &&
+        /只允许操作 \/data\/hello 内的路径/.test(byId['fs-msg']._text), byId['fs-msg']._text);
+  check('重新勾上后文案回到「只允许操作 /data/hello 内的路径」',
+        byId['fs-scope-txt']._text === '只允许操作 /data/hello 内的路径', byId['fs-scope-txt']._text);
+
+  console.log('\nFiles 面板结果: %d 通过 / %d 失败', pass, fail);
+  process.exit(fail ? 1 : 0);
+})().catch(e => { console.error('harness 崩了:', e); process.exit(2); });

@@ -1,0 +1,49 @@
+/* 只验「沙箱范围」那个勾选框：对着一个 llm_web 把前端脚本跑起来，看勾选框画成什么样
+ *
+ * 用法： LLM_WEB=http://127.0.0.1:8101 FS_ALLOW=0 node scope_ui_test.js
+ *        LLM_WEB=http://127.0.0.1:8103 FS_ALLOW=1 node scope_ui_test.js
+ *
+ *   FS_ALLOW=0  期望：勾上是"勾着的"，文案 = 只允许操作 <fs_root> 内的路径
+ *   FS_ALLOW=1  期望：勾选框是空的，文案带"已放开越界限制"
+ */
+const { buildDom, installGlobals, waitFor } = require('./domstub');
+
+const BASE  = process.env.LLM_WEB || 'http://127.0.0.1:8095';
+const ALLOW = process.env.FS_ALLOW === '1';
+const realFetch = global.fetch;
+
+let pass = 0, fail = 0;
+const check = (n, c, e = '') => c ? (pass++, console.log('  PASS  ' + n))
+                                  : (fail++, console.log('  FAIL  ' + n + '   ' + e));
+
+(async () => {
+  const health = await (await realFetch(BASE + '/api/health')).json();
+  const html   = await (await realFetch(BASE + '/')).text();
+  const js     = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  const byId   = buildDom(html);
+  installGlobals(byId, BASE, realFetch);
+
+  eval(js);                                                  // 执行前端脚本
+  await waitFor(() => byId['stat']._text.length > 0, 5000);   // 等 health 探测回来
+
+  check('health 的 fs_allow_outside 与预期一致', health.fs_allow_outside === ALLOW, health);
+  check('勾选框存在', !!byId['fs-inside']);
+  check('勾选框是只读展示（disabled），点不了',
+        /<input[^>]*id="fs-inside"[^>]*\bdisabled\b[^>]*>/.test(html));
+
+  if (ALLOW) {
+    check('放开时勾选框是空的', byId['fs-inside'].checked === false, byId['fs-inside'].checked);
+    check('放开时文案写"已放开越界限制"',
+          /已放开越界限制/.test(byId['fs-scope-txt']._text), byId['fs-scope-txt']._text);
+    check('放开时整块高亮（.open）', byId['fs-scope'].classList.contains('open'), byId['fs-scope'].className);
+  } else {
+    check('收紧时勾选框是勾上的', byId['fs-inside'].checked === true, byId['fs-inside'].checked);
+    check('收紧时文案 = 只允许操作 ' + health.fs_root + ' 内的路径',
+          byId['fs-scope-txt']._text === '只允许操作 ' + health.fs_root + ' 内的路径',
+          byId['fs-scope-txt']._text);
+    check('收紧时不高亮', !byId['fs-scope'].classList.contains('open'), byId['fs-scope'].className);
+  }
+
+  console.log('\n沙箱勾选框结果: %d 通过 / %d 失败', pass, fail);
+  process.exit(fail ? 1 : 0);
+})().catch(e => { console.error('harness 崩了:', e); process.exit(2); });
